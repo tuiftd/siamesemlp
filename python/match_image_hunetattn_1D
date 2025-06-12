@@ -1,0 +1,259 @@
+# match_with_cached_templates_attn.py
+import numpy as np
+import torch, cv2, time, os
+from PIL import Image
+
+# ========= 模型 =========
+import torch.nn as nn
+import torch.nn.functional as F
+
+def letterbox_gray(image, target_size=256):
+    # 原始图像尺寸 (注意PIL是width, height顺序)
+    w, h = image.size
+    # 计算缩放比例
+    scale = min(target_size / h, target_size / w)
+    # 等比例缩放后的新尺寸
+    new_w, new_h = int(w * scale), int(h * scale)
+    # 缩放图像 (使用PIL的LANCZOS高质量重采样)
+    resized = image.resize((new_w, new_h), Image.LANCZOS)
+    
+    canvas = Image.new('L', (target_size, target_size), (0))
+    
+    # 将缩放后的图像居中放置
+    left = (target_size - new_w) // 2
+    top = (target_size - new_h) // 2
+    canvas.paste(resized, (left, top))
+    
+    return canvas
+
+class DepthwiseSeparableConv(nn.Module):
+    def __init__(self, in_channels, mid_channels,out_channels, stride=1,SE=False):
+        super(DepthwiseSeparableConv, self).__init__()
+        self.pointwise1 = nn.Conv2d(in_channels, mid_channels, kernel_size=1, bias=False)
+        self.depthwise = nn.Conv2d(mid_channels, mid_channels, kernel_size=3,
+                                   stride=stride, padding=1, groups=mid_channels, bias=False)
+        self.pointwise2 = nn.Conv2d(mid_channels, out_channels, kernel_size=1, bias=False)
+        self.SE = SqueezeExcite(mid_channels) if SE else nn.Identity()
+        self.bn1 = nn.BatchNorm2d(mid_channels)
+        self.bn2 = nn.BatchNorm2d(mid_channels)
+        
+
+    def forward(self, x):
+        x = self.pointwise1(x)
+        x = self.bn1(x)
+        x = F.relu(x)
+        x = self.depthwise(x)
+        x = self.bn2(x)
+        x = F.relu(x)
+        x = self.SE(x)
+        x = self.pointwise2(x)
+        return x
+
+class SqueezeExcite(nn.Module):
+    def __init__(self, in_channels, reduction=4):
+        super(SqueezeExcite, self).__init__()
+        reduced_channels = in_channels // reduction
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.se = nn.Sequential(
+            nn.Conv2d(in_channels, reduced_channels, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(reduced_channels, in_channels, kernel_size=1),
+            nn.Hardsigmoid(inplace=True)  # 或使用 nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        scale = self.pool(x)       # [B, C, 1, 1]
+        scale = self.se(scale)     # [B, C, 1, 1]
+        return x * scale           # 逐通道缩放
+
+# ======= 模型结构 =======
+class HuNetAttn_1D(nn.Module):
+    def __init__(self, channel=7, reduction=4):
+        super().__init__()
+        self.attn = nn.Sequential(
+            nn.BatchNorm1d(channel),
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.BatchNorm1d(channel // reduction),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid()
+        )
+        
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(2,16,kernel_size=3,stride=1,padding=1,bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+        )
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.classifier = nn.Sequential(nn.Linear(40,80),
+                                        nn.Hardswish(inplace=True),
+                                        nn.Dropout(p=0.2, inplace=True),
+                                        nn.Linear(80,16))
+        self.last_Linear = nn.Linear(2, 16)
+        self.bn_last = nn.BatchNorm1d(16)
+        self.dropout_last = nn.Dropout(p=0.2)
+        self.head = nn.Linear(16, 1)
+        self.DW1 = DepthwiseSeparableConv(16, 64, 24, 2)
+        self.DW2 = DepthwiseSeparableConv(24, 72, 24, 1, SE=True)
+        #最大池化
+        self.Maxpool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.DW3 = DepthwiseSeparableConv(24, 72, 40, 2)
+        self.DW4 = DepthwiseSeparableConv(40, 120, 40, 1, SE=True)
+        self.Pointwise1 = nn.Sequential(
+        nn.Conv2d(16, 24, kernel_size=1, bias=False),
+        nn.BatchNorm2d(24),
+        nn.ReLU(inplace=True),
+        )
+        self.Pointwise3 =nn.Sequential(
+        nn.Conv2d(24, 40, kernel_size=1),
+        nn.BatchNorm2d(40),
+        nn.ReLU(inplace=True),
+        )
+
+
+        # self.DW5 = DepthwiseSeparableConv(40, 120, 40, 1, SE=True)
+    def canny_conv(self,img):
+        x = self.conv1(img)
+        out = self.DW1(x)
+        out = out+self.Maxpool(self.Pointwise1(x))
+        out = self.DW2(out) + out
+        out = self.DW3(out)+self.Maxpool(self.Pointwise3(out))
+        out = self.DW4(out) + out
+        # out = self.DW5(out) + out
+        out = self.pool(out)
+        out = torch.flatten(out, 1)
+        out = self.classifier(out)
+        return F.normalize(out, p=2, dim=1)
+
+
+
+    def forward(self, hu_a, img_a, hu_b, img_b):
+        D_16_a = self.canny_conv(img_a)
+        D_16_b = self.canny_conv(img_b)
+        D_1 = F.cosine_similarity(D_16_a, D_16_b, dim=1)
+        D_1 = D_1.unsqueeze(1)
+        w_a = self.attn(hu_a)
+        w_b = self.attn(hu_b)
+        hu_a = hu_a + hu_a * w_a
+        hu_b = hu_b + hu_b * w_b
+        d_hu = torch.sum(torch.abs(hu_b - hu_a), 1, keepdim=True)
+        features = torch.cat([D_1, d_hu], dim=1)
+        features = self.last_Linear(features)
+        features = self.bn_last(features)
+        features = F.relu(features)
+        features = self.dropout_last(features)
+        return torch.sigmoid(self.head(features))
+
+# ========= 设备 =========
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ========= Hu 矩 =========
+def compute_log_hu_moments(img=None, image_path=None):
+    if img is None:
+        img = Image.open(image_path).convert('L')
+        img = letterbox_gray(img, target_size=256)
+        img = np.array(img)
+    img = letterbox_gray(img, target_size=256)
+    img = np.array(img)
+    _, binary = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    mask = np.zeros_like(binary)
+    cv2.drawContours(mask, contours, -1, 255, cv2.FILLED)
+    canny = cv2.Canny(mask, 100, 200)
+    # cv2.imshow("contour_mask", mask)
+    # cv2.waitKey(0)
+    m = cv2.moments(mask)
+    hu = cv2.HuMoments(m)
+    log_hu = -np.sign(hu) * np.log10(np.abs(hu) + 1e-10)
+    return log_hu.flatten(),canny,mask
+
+# ========= 推理辅助 =========
+def extract_score(model, hu_query,img_q, hu_template,img_t):
+    
+    with torch.no_grad():
+        score = model(hu_query,img_q, hu_template,img_t).item()          # 概率 [0,1]
+    return score
+
+def match_with_cached_templates(model, query_img, template_dir, topk=3, thr=0.5):
+    hu_q, canny_q, mask_q = compute_log_hu_moments(img=query_img)
+    img_a_torch = torch.cat([torch.tensor(canny_q, dtype=torch.float32).unsqueeze(0),torch.tensor(mask_q, dtype=torch.float32).unsqueeze(0)],dim=0).to(device)
+    img_a_torch = img_a_torch.unsqueeze(0)
+    hu_q = torch.tensor(hu_q, dtype=torch.float32).to(device)
+    hu_q = hu_q.unsqueeze(0)
+
+
+
+    scores = []
+    meta = []
+
+    for fname in os.listdir(template_dir):
+        if not fname.lower().endswith(('.png', '.jpg', '.bmp', '.jpeg')):
+            continue
+
+        fpath = os.path.join(template_dir, fname)
+        img = Image.open(fpath).convert('L')
+        # img_np = np.array(img)
+
+        hu_tmp, canny_tmp, mask_tmp = compute_log_hu_moments(img=img)
+        img_b_torch = torch.cat([torch.tensor(canny_tmp, dtype=torch.float32).unsqueeze(0),torch.tensor(mask_tmp, dtype=torch.float32).unsqueeze(0)],dim=0).to(device)
+        img_b_torch = img_b_torch.unsqueeze(0)
+        hu_tmp = torch.tensor(hu_tmp, dtype=torch.float32).to(device)
+        hu_tmp = hu_tmp.unsqueeze(0)
+        score = extract_score(model, hu_q,img_a_torch, hu_tmp,img_b_torch)
+        scores.append(score)
+        cls_name = os.path.basename(os.path.dirname(fpath))  # 可按文件夹命名区分类别
+        meta.append((cls_name, fname))  # 或 
+        #meta.append((fname,)) #如果只需要文件名
+
+    scores = np.array(scores)
+    dists = 1 - scores
+    idx = np.argsort(dists)[:topk]
+    results = [(dists[i], *meta[i]) if scores[i] >= thr else (0.0, "no match", "") for i in idx]
+    return results
+
+# ========= 主流程 =========
+if __name__ == "__main__":
+    model = HuNetAttn_1D().to(device)
+    model.load_state_dict(torch.load(r"model_pth\huattn\hu_bn_attn_dwcv_se_net_best.pth", map_location=device))
+    model.eval()
+
+    cv2.namedWindow("contour_mask", cv2.WINDOW_NORMAL)
+    img_gray = cv2.imread(r"mubiao_2.bmp", cv2.IMREAD_GRAYSCALE)
+    img_bin = cv2.adaptiveThreshold(img_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                    cv2.THRESH_BINARY_INV, 11, 5)
+    img_bin = cv2.dilate(img_bin, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+    contours, _ = cv2.findContours(img_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    h, w = img_bin.shape
+    result_img = img_gray.copy()
+    if len(img_gray.shape) == 2:
+        result_img = cv2.cvtColor(result_img, cv2.COLOR_GRAY2BGR)
+    cv2.namedWindow("result", cv2.WINDOW_NORMAL)
+    for cnt in contours:
+        if len(cnt) < 10: continue
+        x, y, ww, hh = cv2.boundingRect(cnt)
+        if ww / w > 0.9 and hh / h > 0.9: continue
+        if cv2.contourArea(cnt) < 500: continue
+
+        mask = np.zeros_like(img_bin)
+        cv2.fillPoly(mask, [cnt], 255)
+        patch = mask[y:y + hh, x:x + ww]
+        # cv2.imshow("contour_mask", patch)
+        # cv2.waitKey(0)
+        patch_pil = Image.fromarray(patch.astype('uint8'))
+        res = match_with_cached_templates(
+            model, patch_pil,
+            template_dir=r"model_embeddings\model_img",
+            topk=5, thr=0.5
+        )
+        print("Top Matches:")
+        for dist, cls, name in res:
+            print(f"Class: {cls}, Image: {name}, Dist: {dist:.4f}")
+        best_dict, cls_name, fname = res[0]
+        if best_dict > 0:
+            cv2.rectangle(result_img, (x, y), (x + ww, y + hh), (0, 255, 0))
+            label = f"{fname}:{best_dict:.2f}"
+            cv2.putText(result_img, label, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (0, 255, 0), 1, cv2.LINE_AA)
+    cv2.imshow("result", result_img)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
